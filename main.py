@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Sum up 25 November 2026 world news in one image.
 
-Rewritten from scratch on 25 Nov 2026 in this session.
-Standard library only (no Pillow, no network). Writes a deterministic
-1024x1024 PNG to /output/entry.png, falling back to output/entry.png.
-All text is drawn with an embedded 5x7 bitmap font, scaled up.
+Built from scratch for the make.fun news-image-20261125 bounty.
+Standard library only (binascii, os, struct, zlib), no network.
+Writes a deterministic 1024x1024 PNG to /output/entry.png and to
+output/entry.png next to this script. Text uses an embedded 5x7
+bitmap font drawn by hand, scaled up per element.
 """
 import binascii
 import os
@@ -12,15 +13,15 @@ import struct
 import zlib
 
 W, H = 1024, 1024
-BG = (255, 255, 255)
+WHITE = (255, 255, 255)
 CARD = (242, 244, 247)
-ACCENT = (0, 90, 180)
-TEXT = (17, 24, 39)
+BLUE = (0, 90, 180)
+DARK = (17, 24, 39)
 MUTED = (75, 85, 99)
 GOLD = (251, 191, 36)
-DARK = (17, 24, 39)
+BLACK = (0, 0, 0)
 
-# 5x7 bitmap font, '1' = pixel on
+# Embedded 5x7 bitmap font. Each glyph is 7 rows of 5 chars; '1' = on.
 FONT = {
     'A': ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
     'B': ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
@@ -71,8 +72,7 @@ FONT = {
     '*': ["00000", "10101", "01110", "11111", "01110", "10101", "00000"],
 }
 
-# Six stories for 25 November 2026, in the order they appear on the card.
-HEADLINES = [
+STORIES = [
     ("1  NVIDIA", "HUANG APOLOGISES TO STAFF",
      "HUANG APOLOGISED TO NVIDIA STAFF AFTER HIS CEO COMEBACK. "
      "SHARES CLOSED 31.5% HIGHER."),
@@ -96,115 +96,120 @@ HEADLINES = [
 FOOTER = "SOURCES: TOI, JAGRAN JOSH, NEWSREEL, BLOOMBERG, BBC * 25 NOV 2026"
 
 
-def png_chunk(typ, data):
-    body = struct.pack(">I", len(data)) + typ + data
-    return body + struct.pack(">I", binascii.crc32(typ + data) & 0xFFFFFFFF)
+def chunk(kind, payload):
+    """One PNG chunk: length, type, data, CRC32 of type+data."""
+    crc = binascii.crc32(kind + payload) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc)
 
 
-def save_png(path, pixels):
-    raw = b"".join(
-        b"\x00" + bytes(pixels[y * W * 3:(y + 1) * W * 3]) for y in range(H)
+def encode_png(pixels):
+    """Encode the RGB pixel buffer (W*H*3 bytes) as a PNG byte string."""
+    scanlines = b"".join(
+        b"\x00" + bytes(pixels[row * W * 3:(row + 1) * W * 3])
+        for row in range(H)
     )
-    png = b"\x89PNG\r\n\x1a\n"
-    png += png_chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    png += png_chunk(b"IDAT", zlib.compress(raw, 9))
-    png += png_chunk(b"IEND", b"")
-    with open(path, "wb") as fh:
-        fh.write(png)
-    return len(png)
+    out = b"\x89PNG\r\n\x1a\n"
+    out += chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+    out += chunk(b"IDAT", zlib.compress(scanlines, 9))
+    out += chunk(b"IEND", b"")
+    return out
 
 
 class Canvas:
-    """A flat RGB pixel buffer with rectangle and bitmap-text drawing."""
+    """Flat RGB framebuffer with rectangle fill and bitmap text."""
 
-    def __init__(self):
-        self.buf = bytearray(BG * W * H)
+    def __init__(self, bg):
+        self.px = bytearray(bg * (W * H))
 
-    def rect(self, x, y, w, h, color):
-        x0, x1 = max(0, x), min(W, x + w)
-        y0, y1 = max(0, y), min(H, y + h)
-        if x0 >= x1 or y0 >= y1:
+    def fill_rect(self, x, y, w, h, color):
+        left, right = max(0, x), min(W, x + w)
+        top, bottom = max(0, y), min(H, y + h)
+        if left >= right or top >= bottom:
             return
-        px = bytes(color)
-        for yy in range(y0, y1):
-            base = (yy * W + x0) * 3
-            for xx in range(x0, x1):
-                i = (yy * W + xx) * 3
-                self.buf[i:i + 3] = px
+        rgb = bytes(color)
+        for yy in range(top, bottom):
+            offset = (yy * W + left) * 3
+            for _ in range(left, right):
+                self.px[offset:offset + 3] = rgb
+                offset += 3
 
-    def text(self, x, y, s, scale, color):
-        cx = x
-        for ch in s.upper():
+    def draw_text(self, x, y, text, scale, color):
+        pen_x = x
+        for ch in text.upper():
             glyph = FONT.get(ch, FONT[" "])
-            for gy, row in enumerate(glyph):
-                for gx, bit in enumerate(row):
+            for row_i, row in enumerate(glyph):
+                for col_i, bit in enumerate(row):
                     if bit == "1":
-                        self.rect(cx + gx * scale, y + gy * scale,
-                                  scale, scale, color)
-            cx += 6 * scale
-        return cx
+                        self.fill_rect(pen_x + col_i * scale,
+                                       y + row_i * scale,
+                                       scale, scale, color)
+            pen_x += 6 * scale
+        return pen_x
 
     @staticmethod
-    def text_w(s, scale):
-        return len(s) * 6 * scale
+    def measure(text, scale):
+        return len(text) * 6 * scale
 
-    def wrap(self, s, scale, max_w):
-        lines, cur = [], ""
-        for word in s.split():
-            trial = (cur + " " + word).strip()
-            if self.text_w(trial, scale) <= max_w:
-                cur = trial
+    def wrap_text(self, text, scale, max_width):
+        lines = []
+        current = ""
+        for word in text.split():
+            candidate = (current + " " + word).strip()
+            if self.measure(candidate, scale) <= max_width:
+                current = candidate
             else:
-                if cur:
-                    lines.append(cur)
-                cur = word
-        if cur:
-            lines.append(cur)
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
         return lines
 
 
-def draw():
-    c = Canvas()
-    # Header band
-    c.rect(0, 0, W, 110, DARK)
-    c.rect(0, 110, W, 4, ACCENT)
-    c.text(40, 20, "WORLD NEWS", 7, (255, 255, 255))
-    c.text(40, 78, "25 NOVEMBER 2026", 3, ACCENT)
-    c.rect(830, 24, 154, 56, GOLD)
-    c.text(848, 38, "25 NOV", 3, (0, 0, 0))
-    # Six story cards
+def render():
+    img = Canvas(WHITE)
+    # Header: dark band, blue rule, gold date box.
+    img.fill_rect(0, 0, W, 110, DARK)
+    img.fill_rect(0, 110, W, 4, BLUE)
+    img.draw_text(40, 20, "WORLD NEWS", 7, WHITE)
+    img.draw_text(40, 78, "25 NOVEMBER 2026", 3, BLUE)
+    img.fill_rect(830, 24, 154, 56, GOLD)
+    img.draw_text(848, 38, "25 NOV", 3, BLACK)
+    # Story cards.
     y = 124
-    for kicker, title, body in HEADLINES:
-        c.rect(32, y, 960, 132, CARD)
-        c.rect(32, y, 8, 132, ACCENT)
-        c.text(62, y + 12, kicker, 2, ACCENT)
-        c.text(62, y + 36, title, 4, TEXT)
-        ly = y + 82
-        for line in c.wrap(body, 3, 880)[:2]:
-            c.text(62, ly, line, 3, MUTED)
-            ly += 26
+    for kicker, title, body in STORIES:
+        img.fill_rect(32, y, 960, 132, CARD)
+        img.fill_rect(32, y, 8, 132, BLUE)
+        img.draw_text(62, y + 12, kicker, 2, BLUE)
+        img.draw_text(62, y + 36, title, 4, DARK)
+        line_y = y + 82
+        for line in img.wrap_text(body, 3, 880)[:2]:
+            img.draw_text(62, line_y, line, 3, MUTED)
+            line_y += 26
         y += 142
-    # Footer
-    c.text(40, 988, FOOTER, 2, MUTED)
-    return c.buf
+    img.draw_text(40, 988, FOOTER, 2, MUTED)
+    return img.px
 
 
 def main():
-    pixels = draw()
-    written = []
+    data = encode_png(render())
     here = os.path.dirname(os.path.abspath(__file__))
-    targets = ["/output/entry.png",
-               os.path.join(here, "output", "entry.png")]
-    for path in targets:
+    destinations = ["/output/entry.png",
+                    os.path.join(here, "output", "entry.png")]
+    saved = []
+    for dest in destinations:
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            size = save_png(path, pixels)
-            written.append(path)
-            print(f"wrote {path} {size} bytes")
-        except Exception as exc:  # keep going if /output is not writable
-            print(f"skip {path}: {exc}")
-    if not written:
-        raise SystemExit("could not write any output")
+            folder = os.path.dirname(dest)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(dest, "wb") as fh:
+                fh.write(data)
+            saved.append(dest)
+            print("wrote %s %d bytes" % (dest, len(data)))
+        except OSError as exc:
+            print("skip %s: %s" % (dest, exc))
+    if not saved:
+        raise SystemExit("no output could be written")
 
 
 if __name__ == "__main__":
